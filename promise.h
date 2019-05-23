@@ -1,18 +1,19 @@
 #ifndef PROMISE_H_
 #define PROMISE_H_
 
-// Promise: inspired by Javascript Promise/A+ 
-// Intended for builds that disable exception support (errors are up to user).
-
-#include <assert.h>
 #include <stdlib.h>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <iterator>
+#include <variant>  
 #include <vector>
 
-#include "util/require.h"
+// Promise: inspired by Javascript Promise/A+ (without exception support)
+
+// Definitions imported from original codebase...
+#define CHK(cond, msg) assert(cond && msg)
+#define REQUIRE(...) typename std::enable_if<__VA_ARGS__>::type* _z = 0
 
 namespace promise_internal {
 
@@ -26,46 +27,37 @@ struct Flags {
   static const char kDisableAll = kDisableThen | kDisableResolveAndDeferred;
 };
 
-// U will be int if T is void, T otherwise
-template <typename T, typename F, typename U>
-inline void finalize(F* invoke, char flags, U&& resolved_value) {
-  if (flags & Flags::kResolved) {
-    assert((flags & Flags::kHead) && "unexpected resolve on non-head promise");
-    if constexpr (!std::is_void_v<T>) {
-      (*invoke)(std::forward<T>(resolved_value));
-    } else {
-      (*invoke)();
-    }
-  } else if (flags & Flags::kDeferred) {
-    assert((flags & Flags::kHead) && "unexpected deferred on non-head promise");
-    // We depend on the deferred callback to eventually be called,
-    // which will in turn call invoke_.
-  } else if (flags & Flags::kHead) {
-    assert(!(flags & Flags::kThenAttached) && "promise not resolved/deferred");
-    delete invoke; // this is an unused promise, so we can clean up directly
-  } else {
-    // Otherwise, this is a downstream promise and which must be invoked in
-    // order to be cleaned up.
-  }
-}
-
 template<typename T>
 class PromiseBase {
  public:
   PromiseBase() {
+    // Create a default invoke deletes the containing function object.
+    // Any reassignments to this function object must do the same.
+    // The reason we don't create an object on demand is because we need
+    // to capture downstream invoke objects in then().
     invoke_ = new std::function<void(T)>;
     *invoke_ = [invoke{invoke_}](T) { delete invoke; };
     flags_ = Flags::kHead;
   }
 
-  ~PromiseBase() { finalize<T>(invoke_, flags_, std::move(resolved_value_)); }
+  ~PromiseBase() { 
+    if (flags_ & Flags::kResolved) {
+      CHK(flags_ & Flags::kHead, "unexpected resolve on non-head promise");
+      (*invoke_)(std::forward<T>(std::get<T>(resolved_value_)));
+    } else if (flags_ & Flags::kDeferred) {
+      CHK(flags_ & Flags::kHead, "unexpected deferred on non-head promise");
+    } else if (flags_ & Flags::kHead) {
+      CHK(!(flags_ & Flags::kThenAttached), "promise must be resolved/deferred");
+      delete invoke_;
+    }
+  }
 
   PromiseBase(PromiseBase<T>&& rhs) {
     this->move(std::forward<PromiseBase<T>>(rhs));
   }
 
   void copy(const PromiseBase<T>& rhs) {
-    assert(!(rhs.flags_ & Flags::kDisableThen) && "rhs promise must be at tail");
+    CHK(!(rhs.flags_ & Flags::kDisableThen), "rhs promise must be at tail");
     this->flags_ = Flags::kDisableResolveAndDeferred;
     this->invoke_ = rhs.invoke_;
     const_cast<PromiseBase<T>&>(rhs).flags_ |= Flags::kDisableThen;
@@ -81,28 +73,30 @@ class PromiseBase {
 
   template <typename X>
   void resolve(X&& x) {
-    assert((flags_ & Flags::kHead) && "resolve only callable on head of chain");
-    assert(!(flags_ & Flags::kDisableResolveAndDeferred) &&
+    CHK(flags_ & Flags::kHead, "resolve only callable on head of chain");
+    CHK(!(flags_ & Flags::kDisableResolveAndDeferred), 
         "already resolved/deferred, was moved, or is copy of another promise");
     flags_ |= Flags::kResolved | Flags::kDisableResolveAndDeferred;
-    resolved_value_ = std::move(x);
+    resolved_value_.template emplace<T>(std::forward<T>(x));
   }
 
   auto deferred() {
-    assert((flags_ & Flags::kHead) && "deferred only callable on head of chain");
-    assert(!(flags_ & Flags::kDisableResolveAndDeferred) &&
+    CHK(flags_ & Flags::kHead, "deferred only callable on head of chain");
+    CHK(!(flags_ & Flags::kDisableResolveAndDeferred),
         "already resolved/deferred, was moved, or is copy of another promise");
     flags_ |= Flags::kDeferred | Flags::kDisableResolveAndDeferred;
     return [&invoke{*invoke_}](T t) { invoke(std::move(t)); };
   }
 
  protected:
-  template <typename F>
-  using is_invocable = std::is_invocable<F, T&>;
-
-  std::function<void(T)>* invoke_;
-  T resolved_value_{};
+  template <typename F> using is_invocable = std::is_invocable<F, T&>;
+  std::function<void(T)>* invoke_; // heap allocated invocation function
   char flags_ = 0;
+ 
+ private:
+  // Pay for the space of T w/o the requirement or cost of a default 
+  // construction of T, which happens externally and we move them in.
+  std::variant<std::monostate, T> resolved_value_;
 };
 
 template<>
@@ -114,14 +108,24 @@ class PromiseBase<void> {
     flags_ = Flags::kHead;
   }
 
-  ~PromiseBase() { finalize<void>(invoke_, flags_, 0); }
+  ~PromiseBase() { 
+    if (flags_ & Flags::kResolved) {
+      CHK(flags_ & Flags::kHead, "unexpected resolve on non-head promise");
+      (*invoke_)();
+    } else if (flags_ & Flags::kDeferred) {
+      CHK(flags_ & Flags::kHead, "unexpected deferred on non-head promise");
+    } else if (flags_ & Flags::kHead) {
+      CHK(!(flags_ & Flags::kThenAttached), "promise must be resolved/deferred");
+      delete invoke_;
+    }
+  }
 
   PromiseBase(PromiseBase<void>&& rhs) { 
     this->move(std::forward<PromiseBase<void>>(rhs)); 
   }
 
   void copy(const PromiseBase<void>& rhs) {
-    assert(!(rhs.flags_ & Flags::kDisableThen) && "rhs must be tail of chain");
+    CHK(!(rhs.flags_ & Flags::kDisableThen), "rhs must be at tail of chain");
     this->invoke_ = rhs.invoke_;
     this->flags_ = Flags::kDisableResolveAndDeferred;
     const_cast<PromiseBase<void>&>(rhs).flags_ |= Flags::kDisableThen;
@@ -135,23 +139,22 @@ class PromiseBase<void> {
   }
 
   void resolve() {
-    assert((flags_ & Flags::kHead) && "resolve only callable on head of chain");
-    assert(!(flags_ & Flags::kDisableResolveAndDeferred) &&
+    CHK(flags_ & Flags::kHead, "resolve only callable on head of chain");
+    CHK(!(flags_ & Flags::kDisableResolveAndDeferred),
         "already resolved/deferred, was moved, or is copy of another promise");
     flags_ |= Flags::kResolved | Flags::kDisableResolveAndDeferred;
   }
 
   auto deferred() {
-    assert((flags_ & Flags::kHead) && "deferred only callable on head of chain");
-    assert(!(flags_ & Flags::kDisableResolveAndDeferred) &&
+    CHK(flags_ & Flags::kHead, "deferred only callable on head of chain");
+    CHK(!(flags_ & Flags::kDisableResolveAndDeferred),
         "already resolved/deferred, was moved, or is copy of another promise");
     flags_ |= Flags::kDeferred | Flags::kDisableResolveAndDeferred;
     return [&invoke{*invoke_}] { invoke(); };
   }
 
  protected:
-  template <typename F>
-  using is_invocable = std::is_invocable<F>;
+  template <typename F> using is_invocable = std::is_invocable<F>;
   std::function<void()>* invoke_;
   char flags_;
 };
@@ -183,52 +186,41 @@ class Promise : private promise_internal::PromiseBase<T> {
   template <typename F>
   using is_invocable = typename base_type::template is_invocable<F>;
   template <typename U>
-  static const bool is_promise = 
-      decltype(promise_internal::has_base(std::declval<U*>()))::value;
-  template <class U>
-  friend class Promise;
+  static const bool is_promise =  decltype(promise_internal::has_base(
+      std::declval<typename std::decay<U>::type*>()))::value;
+  template <class U> friend class Promise;
 
  public:
   // Default constructor is defined.
   Promise() : base_type() {}
 
-  // Copy construction is defined for this promise specialization, but with 
-  // following enforced constraints:
+  // Move and copy construction is defined.
+  // For copy construction, we observe the following enforced constraints:
   // 1. The rhs can't have a then() attached (i.e. it's a tail of a continuation
   //    chain.
   // 2. The rhs is blocked from having a then() attached; only lhs is then-able.
   // 3. The lhs can't can't call resolve() or deferred(), i.e. lhs can't invoke.
   // In other words, while both the lhs and rhs reference the same invoke_ 
   // function object, only rhs can call it and only lhs assign to it with then().
-  // The reason we want this is because there are times where we want to say
-  // auto q = p.then(...1); q.then(...2), which should behave like
-  // p.then(...1).then(...2), but with q live and p dead.
-  Promise(const Promise<T>& rhs) : base_type(std::forward<base_type>(rhs)) {}
-
-  // Copy construction is deleted for all other promise specializations.
-  template <typename X>
-  Promise(const Promise<X>&, REQUIRE(is_promise<X>)) = delete;
-
-  // Move construction is defined for this promise specialization: the lhs
-  // takes on all the properties of the rhs, and the rhs is prohibited from
-  // any further operations.
-  Promise(Promise<T>&& rhs) : base_type(std::forward<base_type>(rhs)) {}
-
-  // Move construction is deleted for all other promise specializations.
-  template <typename X>
-  Promise(Promise<X>&&, REQUIRE(is_promise<X>)) = delete;
+  // For move construction, the lhs takes on all the properties of the rhs,
+  // and the rhs is prohibited from any further operations.
+Promise(Promise<T>&& rhs) : base_type(std::forward<base_type>(rhs)) {}
 
   // Other constructors with non-promise values are the same as using resolve().
-  template <typename X>
-  Promise(X x, REQUIRE(!is_promise<X>)) { this->resolve(x); }
-  
-  // Copy assignment same as copy construction
+  template <typename X> Promise(X&& x, REQUIRE(!is_promise<X>)) {
+    this->resolve(std::forward<T>(x));
+  }
+
+  // Move and copy construction is deleted for all other promise specializations.
+  template <typename X> Promise(Promise<X>&&, REQUIRE(is_promise<X>)) = delete;
+
+  // Copy assignment same as copy construction. See fine print above.
   const Promise<T>& operator=(const Promise<T>& rhs) {
     this->copy(std::forward<base_type>(rhs));
     return *this;
   }
 
-  // Move assignment same as move construction
+  // Move assignment same as move construction. See fine print above.
   const Promise<T>& operator=(Promise<T>&& rhs) {
     this->move(std::forward<base_type>(rhs));
     return *this;
@@ -260,7 +252,7 @@ class Promise : private promise_internal::PromiseBase<T> {
     // indicates the both the promise type and the incompatible argument type.
     // For example: Promise<int> f; f.then([](std::string) {}); is an error
     // because there is no implicit conversion from int to std::string.
-    // Since it's improtant that the note is easily seen (type mismatches 
+    // Since it's important that the note is easily seen (type mismatches 
     // can sometimes be obscure), we inhibit clang from moving the static_assert
     // message to the next line.
     // clang-format off
@@ -272,42 +264,7 @@ class Promise : private promise_internal::PromiseBase<T> {
     assert(!(this->flags_ & Flags::kDisableThen) &&
         "then() already attached or promise was copied or moved");
     this->flags_ |= Flags::kDisableThen;
-    if constexpr (!std::is_void_v<T>) {
-      if constexpr (is_promise<std::invoke_result_t<typename std::decay<F>::type, T&>>) {
-        using U = std::invoke_result_t<typename std::decay<F>::type, T&>;
-        using V = typename U::type;
-        Promise<V> promise;
-        promise.flags_ = 0;
-        *this->invoke_ = [this_invoke{this->invoke_},
-                          &next_invoke{*promise.invoke_},
-                          target{std::move(target)}](T t) mutable {
-          U u = target(t);
-          if constexpr (!std::is_void_v<V>) {
-            u.then([&next_invoke](V v) mutable { next_invoke(v); });
-          } else {
-            u.then([&next_invoke]() { next_invoke(); });
-          }
-          delete this_invoke;
-        };
-        return promise;
-      } else { // T is non-void, U is non-promise
-        using U = std::invoke_result_t<F, T&>;
-        Promise<U> promise;
-        promise.flags_ = 0;
-        *this->invoke_ = [this_invoke{this->invoke_},
-                          &next_invoke{*promise.invoke_},
-                          target{std::move(target)}](T t) mutable {
-          if constexpr (!std::is_void_v<U>) {
-            next_invoke(target(t));
-          } else {
-            target(t);
-            next_invoke();
-          }
-          delete this_invoke;
-        };
-        return promise;
-      }
-    } else { // T is void
+    if constexpr (std::is_void_v<T>) {
       if constexpr (is_promise<std::invoke_result_t<F>>) {
         using U = std::invoke_result_t<F>;
         using V = typename U::type;
@@ -317,10 +274,10 @@ class Promise : private promise_internal::PromiseBase<T> {
                           &next_invoke{*promise.invoke_},
                           target{std::move(target)}]() mutable {
           U u = target();
-          if constexpr (!std::is_void_v<V>) {
-            u.then([&next_invoke](V v) mutable { next_invoke(v); });
-          } else {
+          if constexpr (std::is_void_v<V>) {
             u.then([&next_invoke]() { next_invoke(); });
+          } else {
+            u.then([&next_invoke](V v) mutable { next_invoke(v); });
           }
           delete this_invoke;
         };
@@ -332,11 +289,46 @@ class Promise : private promise_internal::PromiseBase<T> {
         *this->invoke_ = [this_invoke{this->invoke_},
                           &next_invoke{*promise.invoke_},
                           target{std::move(target)}]() mutable {
-          if constexpr (!std::is_void_v<U>) {
-            next_invoke(target());
-          } else {
+          if constexpr (std::is_void_v<U>) {
             target();
             next_invoke();
+          } else {
+            next_invoke(target());
+          }
+          delete this_invoke;
+        };
+        return promise;
+      }
+    } else {
+      if constexpr (is_promise<std::invoke_result_t<F, T&>>) {
+        using U = std::invoke_result_t<F, T&>;
+        using V = typename U::type;
+        Promise<V> promise;
+        promise.flags_ = 0;
+        *this->invoke_ = [this_invoke{this->invoke_},
+                          &next_invoke{*promise.invoke_},
+                          target{std::move(target)}](T t) mutable {
+          U u = target(t);
+          if constexpr (std::is_void_v<V>) {
+            u.then([&next_invoke]() { next_invoke(); });
+          } else {
+            u.then([&next_invoke](V v) mutable { next_invoke(v); });
+          }
+          delete this_invoke;
+        };
+        return promise;
+      } else { // T is non-void, U is non-promise
+        using U = std::invoke_result_t<F, T&>;
+        Promise<U> promise;
+        promise.flags_ = 0;
+        *this->invoke_ = [this_invoke{this->invoke_},
+                          &next_invoke{*promise.invoke_},
+                          target{std::move(target)}](T t) mutable {
+          if constexpr (std::is_void_v<U>) {
+            target(t);
+            next_invoke();
+          } else {
+            next_invoke(target(t));
           }
           delete this_invoke;
         };
@@ -361,20 +353,29 @@ class Promise : private promise_internal::PromiseBase<T> {
   // be finalized before invoking.
   using promise_internal::PromiseBase<T>::resolve;
 
+  // get() appends a blocking function at the end of a continuation chain
+  // and returns the resulting T value.
   auto get() {
     std::mutex mutex;
     std::condition_variable cv;
-    if constexpr (!std::is_void_v<T>) {
-      T result;
-      then([&cv, &result](T t) { cv.notify_one(); result = std::move(t); });
-      std::unique_lock<std::mutex> lock(mutex);
-      cv.wait(lock);
-      return result;
-    } else {
-      then([&cv]() { cv.notify_one(); });
+    if constexpr (std::is_void_v<T>) {
+      then([&mutex, &cv]() mutable {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.notify_one();
+      });
       std::unique_lock<std::mutex> lock(mutex);
       cv.wait(lock);
       return;
+    } else {
+      T result;
+      then([&mutex, &cv, &result](T t) mutable {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.notify_one();
+        result = std::move(t);
+      });
+      std::unique_lock<std::mutex> lock(mutex);
+      cv.wait(lock);
+      return result;
     }
   }
 
@@ -382,11 +383,11 @@ class Promise : private promise_internal::PromiseBase<T> {
   // ForAll(...).wait().then([](std::vector<...> values)) { ... });
   // It can also be used in lieu of Promise<void>.get() which is ill-defined.
   auto wait() {
-    if constexpr (!std::is_void_v<T>) {
-      return MakePromise(get());
-    } else {
+    if constexpr (std::is_void_v<T>) {
       get();
       return MakePromise();
+    } else {
+      return MakePromise(get());
     }
   }
 };
@@ -442,8 +443,8 @@ inline Promise<std::vector<T>> ForAll(Iterator begin, Iterator end,
   if (count == 0) return MakePromise(std::vector<T>{});
   Promise<std::vector<T>> promise;
   auto cb = promise.deferred();
-  std::vector<T>* values = new std::vector<T>();
   std::mutex* mutex = new std::mutex();
+  std::vector<T>* values = new std::vector<T>();
   while (begin != end) {
     promise_fn(*begin++).then([cb, mutex, values, count](T t) mutable {
       bool done;
@@ -453,11 +454,11 @@ inline Promise<std::vector<T>> ForAll(Iterator begin, Iterator end,
         done = values->size() == count;
       }
       if (done) {
-        std::vector<T> ret;
-        ret.swap(*values);
-        delete values;
         delete mutex;
-        cb(std::move(ret));
+        std::vector<T> result;
+        result.swap(*values);
+        delete values;
+        cb(std::move(result));
       }
     });
   }
