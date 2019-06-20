@@ -341,7 +341,7 @@ TEST(PromiseTests, ThenTest) {
     p.then([](int i) { return i; }).then([&cases](int i) { cases |= i; });
     p.resolve(1<<15);
   }
-  CHK(cases = 0xFFFF);
+  CHK(cases == 0xFFFF);
 }
 
 int value_2c_2 = 0;
